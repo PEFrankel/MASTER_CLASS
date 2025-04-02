@@ -1,0 +1,372 @@
+---
+title: Temporal Expression and Overlap Analysis of Doxycycline Response in Mouse Stem
+  Cells
+author: "Patrick Frankel and Quinten Kinney"
+date: "2025-03-18"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: paper
+    code_folding: show
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(DESeq2)
+library(dplyr)
+library(tidyr)
+library(tibble) # Needed explicitly for knitting
+library(readr)
+library(ggplot2)
+library(stringr)
+library(purrr)
+library(pheatmap)
+library(RColorBrewer) # This was used by an example. You're welcome to not use this
+# Downloading the following package cuts ~200 lines of manual code for overlap interaction figures
+library(UpSetR)
+```
+
+## Introduction
+
+This analysis examines the effects of doxycycline (dox) treatment on gene expression in mouse stem cells over time. Understanding doxycycline's effects on gene expression is crucial when interpreting results from experiments using doxycycline-controlled systems. We'll use the RNA-seq data processed through a NF-CORE pipeline to identify significant changes in gene expression, temporal patterns, and expression overlap affected by doxycycline treatment.
+Our analysis focuses on identifying differentially expressed genes at multiple time points (12, 24, 48, and 96 hours) compared to baseline (0 hours), allowing us to characterize both the magnitude and temporal dynamics of doxycycline's effects. By examining when genes first become differentially expressed and how expression patterns persist or change across time points, we can uncover potential direct and indirect effects of doxycycline treatment.
+
+## Loading and Processing Data
+
+In this section, we prepare the RNA-seq data for analysis by loading the count matrix generated from the NF-CORE pipeline and creating appropriate metadata for the DESeq2 analysis. The goal is to organize the sample information properly to enable accurate differential expression testing across time points.
+
+### Loading Count Matrix and Sample Information
+
+```{r load_data}
+# Load counts matrix from salmon merged gene counts
+counts_matrix <- read.table("/scratch/Shares/rinnclass/MASTER_CLASS/STUDENTS/pafr7911/MASTER_CLASS/data/salmon.merged.gene_counts.tsv", header = TRUE, row.names = 1)
+
+# Create gene ID to gene name conversion table
+g2s <- data.frame(
+  gene_id = rownames(counts_matrix),
+  gene_name = counts_matrix[, 1]
+)
+
+# Remove gene name column for DESeq2 analysis
+counts_matrix <- counts_matrix[, -1]
+
+# Round counts to integer mode required for DESeq2
+counts_integer <- round(counts_matrix)
+```
+
+### Creating Sample Metadata for DESeq2
+
+```{r create_sample_metadata}
+# Create sample information dataframe
+deseq_samples <- data.frame(
+  sample_id = colnames(counts_matrix))
+
+# Extract time point and replicate information from sample IDs
+split_values <- strsplit(deseq_samples$sample_id, "_")
+time_values <- sapply(split_values, function(x) x[[2]])
+replicate_values <- sapply(split_values, function(x) x[[3]])
+
+# Add time point and replicate columns to sample information
+deseq_samples$time_point <- time_values
+deseq_samples$replicate <- replicate_values
+
+# Convert time point and replicate to factors (required for DESeq2)
+deseq_samples$time_point <- factor(deseq_samples$time_point)
+deseq_samples$replicate <- factor(deseq_samples$replicate)
+
+# Set row names for DESeq2
+deseq_samples <- column_to_rownames(deseq_samples, "sample_id")
+
+# Verify column and row names match
+stopifnot(all(colnames(counts_integer) == rownames(deseq_samples)))
+```
+
+### Discussion
+
+This data processing approach effectively handles the count matrix by creating a gene ID to gene name conversion table, which will be useful for biological interpretation later. 
+
+## Differential Expression Analysis
+
+This next section aims to identify genes significantly affected by doxycycline treatment using various stringency thresholds with the DESeq results. By applying different cutoffs for fold change and adjusted p-values, we can differentiate subtle changes with highly robust signals. This step is crucial for downstream analyses as it determines which genes will be examined for temporal patterns. We can also begin identifying which genes exhibit expression overlap in multiple time points and separate upregulated and downregulated genes.
+
+### Running DESeq2
+
+```{r run_deseq2}
+# Create DESeq2 dataset
+dds_time_point <- DESeqDataSetFromMatrix(countData = counts_integer,
+                                        colData = deseq_samples,
+                                        design = ~ time_point + replicate)
+
+# Run DESeq2 analysis
+dds_time_point <- DESeq(dds_time_point) # This takes ~1 min
+
+# Extract results
+result_names <- resultsNames(dds_time_point)[-1]  # Remove intercept
+
+# Filter only for time point comparisons (removing replicate comparisons)
+time_point_results <- result_names[grep("time_point", result_names)]
+
+# Create empty dataframe to store all results
+res_df <- data.frame()
+
+# Get results for each comparison
+for(results_name in time_point_results) {
+  res <- results(dds_time_point, name = results_name)
+  tmp_res_df <- res %>% 
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    merge(g2s) %>%
+    mutate(result_name = results_name)
+  res_df <- bind_rows(res_df, tmp_res_df)
+}
+
+# See NAs in adjusted p-values
+na_count <- sum(is.na(res_df$padj))
+cat("Number of NA adjusted p-values:", na_count, "\n")
+```
+
+### Filtering Significant Genes
+
+```{r filter_significant_genes}
+# Moderate threshold: Log2FC > 0.58 (1.5-fold change) and adjusted p-value < 0.05
+filtered_res_df_moderate <- res_df %>%
+  filter(padj < 0.05, abs(log2FoldChange) > 0.58)
+
+# Stringent threshold: Log2FC > 1 (2-fold change) and adjusted p-value < 0.05
+filtered_res_df_stringent <- res_df %>%
+  filter(padj < 0.05, abs(log2FoldChange) > 1)
+
+# Very stringent threshold: Log2FC > 2 (4-fold change) and adjusted p-value < 0.01
+filtered_res_df_very_stringent <- res_df %>%
+  filter(padj < 0.01, abs(log2FoldChange) > 2)
+
+# Count unique genes at each threshold
+sig_genes_moderate <- unique(filtered_res_df_moderate$gene_id)
+sig_genes_stringent <- unique(filtered_res_df_stringent$gene_id)
+sig_genes_very_stringent <- unique(filtered_res_df_very_stringent$gene_id)
+
+cat("Number of significant genes (moderate threshold):", length(sig_genes_moderate), "\n")
+cat("Number of significant genes (stringent threshold):", length(sig_genes_stringent), "\n")
+cat("Number of significant genes (very stringent threshold):", length(sig_genes_very_stringent), "\n")
+
+# Examine overlap between thresholds (simply a sanity check here)
+moderate_stringent_overlap <- length(intersect(sig_genes_moderate, sig_genes_stringent))
+stringent_very_stringent_overlap <- length(intersect(sig_genes_stringent, sig_genes_very_stringent))
+
+cat("Overlap between moderate and stringent thresholds:", moderate_stringent_overlap, "\n")
+cat("Overlap between stringent and very stringent thresholds:", stringent_very_stringent_overlap, "\n")
+
+# Create a list of significant genes at the stringent threshold for further analysis
+sig_genes_for_analysis <- data.frame(gene_id = sig_genes_stringent)
+```
+
+### Discussion
+
+A quick look at the filtered results shows substantial numbers of differentially expressed genes even at stringent thresholds (log2FC > 1, padj < 0.05), indicating doxycycline has widespread effects on gene expression in mouse stem cells. However, we have already seen these results before; the overlap data now provides a unique perspective between threshold categories, suggesting a core set of strongly affected genes alongside others with more modest responses. For further analysis, we selected the stringent threshold (log2FC > 1, padj < 0.05) to capture meaningful biological changes and provide us with enough _notable_ data to parse and interpret. It may be of interest to the reader to use the moderate threshold instead, depending on prior knowledge of the importance of certain genes identified within this threshold, but not the latter two.
+
+## Data Visualization
+
+Now, we will visually explore how gene expression changes over time following doxycycline treatment. The following visualization shows the total number of up- and downregulated genes at each time point, which may help identify when dox is most potent in vitro. This temporal profiling is essential for understanding whether doxycycline's impact is immediate, delayed, sustained, absent, or influences a different, unique expression pattern.
+
+### Up & Down Regulation Summary
+
+```{r reg_summary_plots, fig.height=8, fig.width=10}
+# Extract time points for timepoint comparisons
+unique_timepoints <- unique(gsub("time_point_|_vs_0", "", time_point_results))
+unique_timepoints <- unique_timepoints[order(as.numeric(unique_timepoints))]
+
+# Summary of significant genes across time points - exxcludes replicates
+time_summary <- filtered_res_df_stringent %>%
+  filter(grepl("time_point", result_name)) %>%
+  group_by(result_name) %>%
+  summarize(
+    total_sig = n(),
+    upregulated = sum(log2FoldChange > 0),
+    downregulated = sum(log2FoldChange < 0)
+  ) %>%
+  mutate(
+    time = gsub("time_point_|_vs_0", "", result_name),
+    time = factor(time, levels = unique_timepoints)
+  )
+
+# Create a summary bar plot
+ggplot(time_summary, aes(x = time)) +
+  geom_bar(aes(y = upregulated, fill = "Upregulated"), stat = "identity") +
+  geom_bar(aes(y = -downregulated, fill = "Downregulated"), stat = "identity") +
+  scale_fill_manual(values = c("Upregulated" = "darkred", "Downregulated" = "darkblue")) +
+  labs(title = "Differentially Expressed Genes Over Time",
+       x = "Time (hours)",
+       y = "Number of Genes",
+       fill = "Regulation") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold")) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black") +
+  scale_y_continuous(labels = function(x) abs(x))
+```
+
+### Discussion
+
+This visualization reveals a clear temporal pattern in doxycycline's effects on gene expression. The most dramatic changes occur at 48 hours, with 280 upregulated and 151 downregulated genes. Interestingly, the response begins more modestly at 12 hours, increases substantially by 24 hours, peaks at 48 hours, and then diminishes by 96 hours to a level comparable to the 12 hour time point. This response curve suggests a transient effect of doxycycline on gene expression. The dominance of upregulation over downregulation indicates that doxycycline activates high-fold-change (stringent threshold) genes more frequently than it represses them in these cells.
+
+* The `time_summary` table with the total number of differentially expressed genes over time
+
+| Time Point | Total Sig | Upregulated Genes | Downregulated Genes |
+|------------|-----------|-------------------|---------------------|
+| 12 hours   | 36        | 25                | 11                  |
+| 24 hours   | 233       | 150               | 83                  |
+| 48 hours   | 431       | 280               | 151                 |
+| 96 hours   | 45        | 16                | 29                  |
+
+### Response Timing Analysis
+
+This analysis examines when genes first show significant differential expression following doxycycline treatment. By identifying the earliest time point at which each gene becomes differentially expressed--and the magintude by which there are--we can distinguish between immediate-early responders and genes that change only after prolonged exposure. This helps separate potential direct targets from secondary targets of doxycycline.
+
+```{r response_timing, fig.height=8, fig.width=10}
+# Identify when each gene first becomes differentially expressed
+first_de_timepoint <- filtered_res_df_stringent %>%
+  group_by(gene_id, gene_name) %>%
+  summarize(
+    first_de_time = min(as.numeric(gsub("time_point_|_vs_0", "", result_name))),
+    direction_at_first_de = ifelse(
+      log2FoldChange[which.min(as.numeric(gsub("time_point_|_vs_0", "", result_name)))] > 0,
+      "Upregulated", "Downregulated"),
+    fc_at_first_de = log2FoldChange[which.min(as.numeric(gsub("time_point_|_vs_0", "", result_name)))],
+    .groups = "drop"
+  )
+
+# Count genes by first time point and direction
+timing_summary <- first_de_timepoint %>%
+  group_by(first_de_time, direction_at_first_de) %>%
+  summarize(count = n(), .groups = "drop")
+
+# Plot timing of first differential expression
+ggplot(timing_summary, aes(x = factor(first_de_time), y = count, fill = direction_at_first_de)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Upregulated" = "darkred", "Downregulated" = "darkblue")) +
+  labs(title = "Timing of Initial Differential Expression",
+       x = "First Time Point of DE (hours)",
+       y = "Number of Genes",
+       fill = "Direction") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Examine magnitude of fold change at first DE by time point
+ggplot(first_de_timepoint, aes(x = factor(first_de_time), y = abs(fc_at_first_de), 
+                             fill = direction_at_first_de)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1) +
+  scale_fill_manual(values = c("Upregulated" = "darkred", "Downregulated" = "darkblue")) +
+  labs(title = "Magnitude of Fold Change at First Differential Expression",
+       x = "First Time Point of DE (hours)",
+       y = "Absolute Log2 Fold Change",
+       fill = "Direction") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+### Discussion
+
+- The analysis reveals that most genes become differentially expressed at either 24 or 48 hours post-treatment, with fewer genes responding very early (12 hours) or very late (96 hours). Upregulated genes outnumber downregulated genes at every time point, with this difference most pronounced at 48 hours--a trend consistent with the previous analysis where the total number of genes affected was analyzed. The relatively small number of genes influenced at 12-hours suggests that doxycycline's immediate direct effects may be limited, while the large number of 24-48 hour responders may represent a mix of direct and indirect effects.
+
+- Looking at the magnitude of fold changes, the 12-hour downregulated genes show remarkably high fold changes compared to other groups, with some exhibiting more than 10-fold changes in expression. This suggests these early responders may be direct targets of doxycycline repression. In contrast, genes that first respond at 24 and 48 hours show more moderate fold changes on average, consistent with downstream effects in regulatory networks. The presence of outliers with very high fold changes at every time point indicates that some genes are particularly sensitive to doxycycline, regardless of when they are expressed.
+
+## Gene Set Overlap Analysis
+
+We'll now examine how sets of differentially expressed genes overlap across time points using UpSet plots. This analysis aims to identify genes with transient versus persistent responses to doxycycline, helping characterize the durability of expression changes and potentially distinguishing between adaptive and sustained effects. These plots again focus specifically on genes showing significant expression changes (stringent threshold: log2FC > 1, padj < 0.05) across different time points.
+
+```{r gene_overlap_analysis, fig.height=12, fig.width=12}
+
+library(grid) # This package is needed for adding titles to UpSet plots, but the result is inconsistent: https://github.com/hms-dbmi/UpSetR/issues/76
+
+# Create lists of significant genes at each time point
+sig_genes_by_timepoint <- list()
+for(time_point in unique_timepoints) {
+  # Upregulated genes
+  up_genes <- filtered_res_df_stringent %>%
+    filter(result_name == paste0("time_point_", time_point, "_vs_0"), 
+           log2FoldChange > 0) %>%
+    pull(gene_id)
+  
+  # Downregulated genes  
+  down_genes <- filtered_res_df_stringent %>%
+    filter(result_name == paste0("time_point_", time_point, "_vs_0"), 
+           log2FoldChange < 0) %>%
+    pull(gene_id)
+  
+  # Store in lists
+  sig_genes_by_timepoint[[paste0(time_point, "h_up")]] <- up_genes
+  sig_genes_by_timepoint[[paste0(time_point, "h_down")]] <- down_genes
+}
+
+# Create an UpSet plot to visualize the overlap between upregulated genes across time points
+up_gene_sets <- sig_genes_by_timepoint[grep("_up$", names(sig_genes_by_timepoint))]
+upset_data_up <- fromList(up_gene_sets)
+names(upset_data_up) <- factor(names(upset_data_up), # An attempt to pass the order explicitly, to no avail
+                               levels = c("12h_up", "24h_up", "48h_up", "96h_up"))
+
+upset(upset_data_up, sets = names(upset_data_up), # Chronological order overridden by UpSetR
+      main.bar.color = "darkred", sets.bar.color = "darkred",
+      text.scale = 1.3, point.size = 3.5, line.size = 1,
+      mainbar.y.label = "Intersection Size", sets.x.label = "Genes Per Timepoint",
+      mb.ratio = c(0.6, 0.4),
+      # Need grid to show title (this doesn't work consistently: https://github.com/hms-dbmi/UpSetR/issues/76)
+      grid.text("Overlap of Significantly Upregulated Genes",x = 0.65, y=0.95, gp=gpar(fontsize=10)))
+
+# Create an UpSet plot for downregulated genes
+down_gene_sets <- sig_genes_by_timepoint[grep("_down$", names(sig_genes_by_timepoint))]
+upset_data_down <- fromList(down_gene_sets)
+names(upset_data_down) <- factor(names(upset_data_down), # An attempt to pass the order explicitly, to no avail
+                               levels = c("12h_down", "24h_down", "48h_down", "96h_down"))
+
+# Create UpSet plot for downregulated genes
+upset(upset_data_down, sets = names(upset_data_down),  # Chronological order overridden by UpSetR
+      main.bar.color = "darkblue", sets.bar.color = "darkblue",
+      text.scale = 1.3, point.size = 3.5, line.size = 1,
+      mainbar.y.label = "Intersection Size", sets.x.label = "Genes Per Timepoint",
+      mb.ratio = c(0.6, 0.4),
+      # Need grid to show title (this doesn't work consistently: https://github.com/hms-dbmi/UpSetR/issues/76)
+      grid.text("Overlap of Significantly Downregulated Genes",x = 0.65, y=0.95, gp=gpar(fontsize=10)))
+
+# Find genes that are consistently differentially expressed across all time points
+all_timepoints <- paste0(unique_timepoints, "h_up")
+consistent_up_genes <- Reduce(intersect, up_gene_sets)
+consistent_down_genes <- Reduce(intersect, down_gene_sets)
+
+cat("Number of consistently upregulated genes across all time points:", length(consistent_up_genes), "\n")
+cat("Number of consistently downregulated genes across all time points:", length(consistent_down_genes), "\n")
+
+consistent_up_gene_names <- g2s$gene_name[match(consistent_up_genes, g2s$gene_id)]
+consistent_down_gene_names <- g2s$gene_name[match(consistent_down_genes, g2s$gene_id)]
+
+cat("\nTop consistently upregulated genes:\n")
+cat(paste(head(consistent_up_gene_names, 20), collapse = ", "), "\n")
+
+cat("\nTop consistently downregulated genes:\n")
+cat(paste(head(consistent_down_gene_names, 20), collapse = ", "), "\n")
+```
+
+### Discussion
+
+  - The expression patterns following doxycycline treatment presented in the UpSet plots reveal distinct waves of transcriptional response in mouse stem cells. All upregulated and downregulated time point responses show both unique and overlapping gene sets. Gene expression overlap is common between 24 and 48 hour time points, however, few genes expressed during the 12 and 96 hour time points overlap with each other and/or the 24 and 48 hour time points likely implying a coordinated regulatory cascade rather than a uniform response. 12/96 overlap with 24/48 exhibits high upregulation with the 12 hour timepoint (i.e. 12-24-48 have a greater intersection size than 24-48-96) and high downregulation with the 96 hour timepoint. This trend also supports the previous conclusion of the upregulated expression of a cascade pathway occurring over the 96 hour test.
+
+  - Consistently expressed or repressed genes tend to be predicted genes or pseudogenes, with their functions likely being regulatory rather than protein-coding. 
+
+Consistently upregulated genes:
+
+  - Gm28438 and Gm48423 non-coding RNAs that haven't been fully characterized in mouse stem cells. Their consistent upregulation across all timepoints suggests they may either play important regulatory roles in the cellular response to doxycycline or have a high enhancer affinity for the drug without relation to the genes' transcribed or independent functions, both potentially affecting stem cell state maintenance or differentiation processes.
+  - Gm20075 is a potentially interesting gene identified as protein-coding and synonymous with the BTF3L4B gene, orthologous to human BTF3L4. BTF3L4 plays a role in influencing protein binding and contributing to the growth and metastasis of certain cancers, suggesting its consistent upregulation in mouse stem cells could have cellular differentiation and/or maintenance implications.
+  
+Consistently downregulated gene:
+
+  - Mageb16-ps2 is a pseudogene related to the MAGE (Melanoma Antigen Gene) family, specifically Mageb16. MAGE family genes are typically involved in cell cycle regulation, apoptosis, and cellular differentiation. The consistent downregulation of Mageb16-ps2 might indicate alteration of cell cycle or differentiation pathways throughout the doxycycline response.
+
+## Conclusion
+
+The persistence of certain gene signatures across multiple time points likely reflects core pathways fundamentally affected by doxycycline. These patterns suggest that the drug may initially trigger a stress response, followed by the activation of specific differentiation programs. This is evidenced by the high initial magnitude of gene expression changes, followed by a significant number of upregulated genes at the 48-hour time point. Most genes showed differential expression at both 24 and 48 hours, with a general trend of more upregulation than downregulation. Overlap analysis revealed both unique and shared gene expression patterns across time points, with the 24-hour and 48-hour time points exhibiting the most overlap. Consistently expressed genes across all time points were primarily non-coding RNAs and pseudogenes, suggesting a regulatory role in the cellular response to doxycycline. These findings indicate that doxycycline triggers a dynamic transcriptional response in mouse stem cells, likely initiating a stress response before influencing specific differentiation programs.
